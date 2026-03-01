@@ -18,7 +18,6 @@ Vanilla Agent - Directly rendering images based on the method section.
 
 from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, Any
-from google.genai import types
 import base64, io, asyncio, re
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -156,16 +155,16 @@ class VisualizerAgent(BaseAgent):
                     aspect_ratio = data["additional_info"]["rounded_ratio"]
 
                 gen_config_args["response_modalities"] = ["IMAGE"]
-                gen_config_args["image_config"] = types.ImageConfig(
-                    aspect_ratio=aspect_ratio,
-                    image_size="1k",
-                )
+                gen_config_args["image_config"] = {
+                    "aspect_ratio": aspect_ratio,
+                    "image_size": "1K",
+                }
             
             if "gemini" in self.model_name:
                 response_list = await generation_utils.call_gemini_with_retry_async(
                     model_name=self.model_name,
                     contents=content_list,
-                    config=types.GenerateContentConfig(**gen_config_args),
+                    config=gen_config_args,
                     max_attempts=5,
                     retry_delay=30,
                 )

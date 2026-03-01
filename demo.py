@@ -158,71 +158,83 @@ async def process_parallel_candidates(data_list, exp_mode="dev_planner_critic", 
 
 async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9", image_size="2K"):
     """
-    Refine an image using an Image Editing API.
-    
-    Args:
-        image_bytes: Image data in bytes
-        edit_prompt: Text description of desired changes
-        aspect_ratio: Output aspect ratio (21:9, 16:9, 3:2)
-        image_size: Output resolution (2K or 4K)
-    
-    Returns:
-        Tuple of (edited_image_bytes, success_message)
+    Refine an image using kie.ai's image generation API.
     """
     try:
-        from google import genai
-        from google.genai import types
-        
-        # Initialize client
-        project_id = get_config_val("google_cloud", "project_id", "GOOGLE_CLOUD_PROJECT", "")
-        location = get_config_val("google_cloud", "location", "GOOGLE_CLOUD_LOCATION", "global")
-        
-        client = genai.Client(vertexai=True, project=project_id, location=location)
-        
-        # Prepare content
-        contents = [
-            types.Part.from_text(text=edit_prompt),
-            types.Part.from_bytes(
-                mime_type="image/jpeg",
-                data=image_bytes
+        import httpx
+        import time
+
+        kie_api_key = get_config_val("api_keys", "kie_api_key", "KIE_API_KEY", "")
+        if not kie_api_key:
+            return None, "KIE_API_KEY not configured"
+
+        headers = {
+            "Authorization": f"Bearer {kie_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        image_model = get_config_val("defaults", "image_model_name", "IMAGE_MODEL_NAME", "nano-banana-2")
+
+        payload = {
+            "model": image_model,
+            "input": {
+                "prompt": edit_prompt[:20000],
+                "aspect_ratio": aspect_ratio,
+                "resolution": image_size.upper(),
+                "output_format": "png",
+            },
+        }
+
+        # Create task
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                "https://api.kie.ai/api/v1/jobs/createTask",
+                headers=headers,
+                json=payload,
             )
-        ]
-        
-        # Configure generation
-        config = types.GenerateContentConfig(
-            temperature=1.0,
-            max_output_tokens=8192,
-            response_modalities=["IMAGE"],
-            image_config=types.ImageConfig(
-                aspect_ratio=aspect_ratio,
-                image_size=image_size,
-            ),
-        )
-        
-        # Generate refined image
-        image_model = get_config_val("defaults", "image_model_name", "IMAGE_MODEL_NAME", "")
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model=image_model,
-            contents=contents,
-            config=config
-        )
-        
-        # Extract image from response
-        if response.candidates and response.candidates[0].content.parts:
-            for part in response.candidates[0].content.parts:
-                if hasattr(part, 'inline_data') and part.inline_data:
-                    edited_image_data = part.inline_data.data
-                    
-                    if isinstance(edited_image_data, bytes):
-                        return edited_image_data, "✅ Image refined successfully!"
-                    elif isinstance(edited_image_data, str):
-                        return base64.b64decode(edited_image_data), "✅ Image refined successfully!"
-        
-        return None, "❌ No image data found in response"
-    
+            resp.raise_for_status()
+            resp_data = resp.json()
+
+        if resp_data.get("code") != 200:
+            return None, f"Task creation failed: {resp_data.get('msg', 'Unknown error')}"
+
+        task_id = resp_data["data"]["taskId"]
+
+        # Poll for result
+        start = time.time()
+        while time.time() - start < 300:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(
+                    "https://api.kie.ai/api/v1/jobs/recordInfo",
+                    headers=headers,
+                    params={"taskId": task_id},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            state = data.get("data", {}).get("state", "")
+
+            if state == "success":
+                result_json_str = data["data"].get("resultJson", "")
+                result_obj = json.loads(result_json_str)
+                result_urls = result_obj.get("resultUrls", [])
+                if result_urls:
+                    async with httpx.AsyncClient(timeout=60) as client:
+                        img_resp = await client.get(result_urls[0])
+                        img_resp.raise_for_status()
+                        return img_resp.content, "Image refined successfully!"
+                return None, "No image in response"
+
+            if state == "fail":
+                fail_msg = data.get("data", {}).get("failMsg", "Unknown error")
+                return None, f"Task failed: {fail_msg}"
+
+            await asyncio.sleep(5)
+
+        return None, "Task timed out"
+
     except Exception as e:
-        return None, f"❌ Error: {str(e)}"
+        return None, f"Error: {str(e)}"
 
 
 def get_evolution_stages(result, exp_mode):

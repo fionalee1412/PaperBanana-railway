@@ -20,7 +20,6 @@ import base64
 import io
 from pathlib import Path
 from typing import Dict, Any
-from google.genai import types
 from PIL import Image
 
 from utils import generation_utils, image_utils
@@ -80,12 +79,12 @@ class PolishAgent(BaseAgent):
             response_list = await generation_utils.call_gemini_with_retry_async(
                 model_name=self.text_model_name,
                 contents=content_list,
-                config=types.GenerateContentConfig(
-                    system_instruction=self.suggestion_system_prompt,
-                    temperature=1,
-                    candidate_count=1,
-                    max_output_tokens=50000,
-                ),
+                config={
+                    "system_instruction": self.suggestion_system_prompt,
+                    "temperature": 1,
+                    "candidate_count": 1,
+                    "max_output_tokens": 50000,
+                },
                 max_attempts=3,
                 retry_delay=10,
             )
@@ -166,17 +165,17 @@ class PolishAgent(BaseAgent):
             response_list = await generation_utils.call_gemini_with_retry_async(
                 model_name=self.image_model_name,
                 contents=content_list,
-                config=types.GenerateContentConfig(
-                    system_instruction=self.system_prompt, # Use the simpler task definition prompt
-                    temperature=self.exp_config.temperature,
-                    candidate_count=1,
-                    max_output_tokens=50000,
-                    response_modalities=["IMAGE"],
-                    image_config=types.ImageConfig(
-                        aspect_ratio=data.get("additional_info", {}).get("rounded_ratio", "16:9"),
-                        image_size="1k",
-                    ),
-                ),
+                config={
+                    "system_instruction": self.system_prompt,
+                    "temperature": self.exp_config.temperature,
+                    "candidate_count": 1,
+                    "max_output_tokens": 50000,
+                    "response_modalities": ["IMAGE"],
+                    "image_config": {
+                        "aspect_ratio": data.get("additional_info", {}).get("rounded_ratio", "16:9"),
+                        "image_size": "1K",
+                    },
+                },
                 max_attempts=5,
                 retry_delay=30,
             )

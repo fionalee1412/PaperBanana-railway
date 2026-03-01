@@ -21,7 +21,6 @@ import json
 import asyncio
 import base64
 import re
-from google.genai import types
 
 from prompts import diagram_eval_prompts, plot_eval_prompts
 from utils.generation_utils import (
@@ -171,12 +170,12 @@ async def _run_single_eval_ref(
             response_text_list = await call_gemini_with_retry_async(
                 model_name=model_name,
                 contents=content_list,
-                config=types.GenerateContentConfig(
-                    system_instruction=sys_prompt,
-                    temperature=1,
-                    candidate_count=1,
-                    max_output_tokens=50000,
-                ),
+                config={
+                    "system_instruction": sys_prompt,
+                    "temperature": 1,
+                    "candidate_count": 1,
+                    "max_output_tokens": 50000,
+                },
             )
         elif "gpt" in model_name or "o1" in model_name or "o3" in model_name:
             response_text_list = await call_openai_with_retry_async(

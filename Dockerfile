@@ -17,5 +17,5 @@ RUN mkdir -p data/PaperBananaBench/diagram data/PaperBananaBench/plot && chmod -
 # Expose port
 EXPOSE 8080
 
-# Run Streamlit
-CMD ["streamlit", "run", "demo.py", "--server.port", "8080", "--server.address", "0.0.0.0"]
+# Run FastAPI
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8080"]

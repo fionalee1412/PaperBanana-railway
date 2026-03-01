@@ -19,7 +19,6 @@ or writing code to generate plots based on the raw data and plot caption.
 
 from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, Any
-from google.genai import types
 import base64, io, asyncio
 from PIL import Image
 import json
@@ -129,16 +128,16 @@ class VanillaAgent(BaseAgent):
         
         if cfg["use_image_generation"]:
             gen_config_args["response_modalities"] = ["IMAGE"]
-            gen_config_args["image_config"] = types.ImageConfig(
-                aspect_ratio=data["additional_info"]["rounded_ratio"],
-                image_size="1k",
-            )
+            gen_config_args["image_config"] = {
+                "aspect_ratio": data["additional_info"]["rounded_ratio"],
+                "image_size": "1K",
+            }
         
         if "gemini" in self.model_name:
             response_list = await generation_utils.call_gemini_with_retry_async(
                 model_name=self.model_name,
                 contents=content_list,
-                config=types.GenerateContentConfig(**gen_config_args),
+                config=gen_config_args,
                 max_attempts=5,
                 retry_delay=30,
             )
