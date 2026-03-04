@@ -2,11 +2,12 @@
 FastAPI layer for PaperVizAgent — one endpoint per agent + full pipeline.
 """
 
+import os
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from agents.retriever_agent import RetrieverAgent
@@ -22,6 +23,16 @@ from utils.paperviz_processor import PaperVizProcessor
 app = FastAPI(title="PaperVizAgent API")
 
 WORK_DIR = Path(__file__).parent
+API_KEY = os.environ.get("API_KEY")
+
+
+async def verify_api_key(request: Request):
+    """Verify Bearer token if API_KEY is configured."""
+    if not API_KEY:
+        return
+    auth = request.headers.get("Authorization", "")
+    if auth != f"Bearer {API_KEY}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -143,7 +154,7 @@ async def health():
     return {"status": "ok"}
 
 
-@app.post("/agents/retriever", response_model=RetrieverResponse)
+@app.post("/agents/retriever", response_model=RetrieverResponse, dependencies=[Depends(verify_api_key)])
 async def run_retriever(req: RetrieverRequest):
     try:
         cfg = _make_config(task_name=req.task_name, retrieval_setting=req.retrieval_setting)
@@ -159,7 +170,7 @@ async def run_retriever(req: RetrieverRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/agents/planner", response_model=PlannerResponse)
+@app.post("/agents/planner", response_model=PlannerResponse, dependencies=[Depends(verify_api_key)])
 async def run_planner(req: PlannerRequest):
     try:
         cfg = _make_config(task_name=req.task_name, retrieval_setting=req.retrieval_setting)
@@ -178,7 +189,7 @@ async def run_planner(req: PlannerRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/agents/stylist", response_model=StylistResponse)
+@app.post("/agents/stylist", response_model=StylistResponse, dependencies=[Depends(verify_api_key)])
 async def run_stylist(req: StylistRequest):
     try:
         cfg = _make_config(task_name=req.task_name)
@@ -197,7 +208,7 @@ async def run_stylist(req: StylistRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/agents/visualizer", response_model=VisualizerResponse)
+@app.post("/agents/visualizer", response_model=VisualizerResponse, dependencies=[Depends(verify_api_key)])
 async def run_visualizer(req: VisualizerRequest):
     try:
         cfg = _make_config(task_name=req.task_name, model_name=req.model_name or "")
@@ -215,7 +226,7 @@ async def run_visualizer(req: VisualizerRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/agents/critic", response_model=CriticResponse)
+@app.post("/agents/critic", response_model=CriticResponse, dependencies=[Depends(verify_api_key)])
 async def run_critic(req: CriticRequest):
     try:
         cfg = _make_config(task_name=req.task_name)
@@ -240,7 +251,7 @@ async def run_critic(req: CriticRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/agents/vanilla", response_model=VanillaResponse)
+@app.post("/agents/vanilla", response_model=VanillaResponse, dependencies=[Depends(verify_api_key)])
 async def run_vanilla(req: VanillaRequest):
     try:
         cfg = _make_config(task_name=req.task_name)
@@ -258,7 +269,7 @@ async def run_vanilla(req: VanillaRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/agents/polish", response_model=PolishResponse)
+@app.post("/agents/polish", response_model=PolishResponse, dependencies=[Depends(verify_api_key)])
 async def run_polish(req: PolishRequest):
     try:
         cfg = _make_config(task_name=req.task_name)
@@ -313,7 +324,7 @@ async def run_polish(req: PolishRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/pipeline", response_model=PipelineResponse)
+@app.post("/pipeline", response_model=PipelineResponse, dependencies=[Depends(verify_api_key)])
 async def run_pipeline(req: PipelineRequest):
     try:
         cfg = _make_config(
