@@ -63,6 +63,10 @@ def _sse_event(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+SSE_KEEPALIVE = ": keepalive\n\n"
+SSE_KEEPALIVE_INTERVAL = 5  # seconds
+
+
 # ── Request / Response Models ────────────────────────────────────────────────
 
 class RetrieverRequest(BaseModel):
@@ -336,17 +340,19 @@ async def run_polish(req: PolishRequest):
 async def run_pipeline(req: PipelineRequest):
     """
     Run the full pipeline as a Server-Sent Events stream.
-    Sends progress events as each agent completes, preventing CDN timeout.
+    Sends keepalive comments every few seconds to prevent CDN timeout,
+    plus progress events as each agent completes.
 
     Events:
-      - event: stage   → {"stage": "retriever", "status": "done", ...}
-      - event: stage   → {"stage": "planner", "status": "done", ...}
-      - ...
+      - event: stage   → {"stage": "retriever", "status": "done"}
       - event: result  → full PipelineResponse JSON
       - event: error   → {"error": "..."}
     """
+    # Queue for SSE events from the background pipeline task
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-    async def _stream() -> AsyncGenerator[str, None]:
+    async def _run_pipeline():
+        """Background task: run agents and push events to queue."""
         try:
             cfg = _make_config(
                 task_name=req.task_name,
@@ -367,60 +373,56 @@ async def run_pipeline(req: PipelineRequest):
 
             exp_mode = req.exp_mode
 
-            # ── Vanilla mode ──
             if exp_mode == "vanilla":
                 agent = VanillaAgent(exp_config=cfg)
                 data = await agent.process(data)
                 data["eval_image_field"] = f"vanilla_{task}_base64_jpg"
-                yield _sse_event("stage", {"stage": "vanilla", "status": "done"})
+                await queue.put(_sse_event("stage", {"stage": "vanilla", "status": "done"}))
 
-            # ── Planner only ──
             elif exp_mode == "dev_planner":
                 retriever = RetrieverAgent(exp_config=cfg)
                 data = await retriever.process(data, retrieval_setting=retrieval_setting)
-                yield _sse_event("stage", {"stage": "retriever", "status": "done"})
+                await queue.put(_sse_event("stage", {"stage": "retriever", "status": "done"}))
 
                 planner = PlannerAgent(exp_config=cfg)
                 data = await planner.process(data)
-                yield _sse_event("stage", {"stage": "planner", "status": "done"})
+                await queue.put(_sse_event("stage", {"stage": "planner", "status": "done"}))
 
                 visualizer = VisualizerAgent(exp_config=cfg)
                 data = await visualizer.process(data)
                 data["eval_image_field"] = f"target_{task}_desc0_base64_jpg"
-                yield _sse_event("stage", {"stage": "visualizer", "status": "done"})
+                await queue.put(_sse_event("stage", {"stage": "visualizer", "status": "done"}))
 
-            # ── Planner + Stylist ──
             elif exp_mode == "dev_planner_stylist":
                 retriever = RetrieverAgent(exp_config=cfg)
                 data = await retriever.process(data, retrieval_setting=retrieval_setting)
-                yield _sse_event("stage", {"stage": "retriever", "status": "done"})
+                await queue.put(_sse_event("stage", {"stage": "retriever", "status": "done"}))
 
                 planner = PlannerAgent(exp_config=cfg)
                 data = await planner.process(data)
-                yield _sse_event("stage", {"stage": "planner", "status": "done"})
+                await queue.put(_sse_event("stage", {"stage": "planner", "status": "done"}))
 
                 stylist = StylistAgent(exp_config=cfg)
                 data = await stylist.process(data)
-                yield _sse_event("stage", {"stage": "stylist", "status": "done"})
+                await queue.put(_sse_event("stage", {"stage": "stylist", "status": "done"}))
 
                 visualizer = VisualizerAgent(exp_config=cfg)
                 data = await visualizer.process(data)
                 data["eval_image_field"] = f"target_{task}_stylist_desc0_base64_jpg"
-                yield _sse_event("stage", {"stage": "visualizer", "status": "done"})
+                await queue.put(_sse_event("stage", {"stage": "visualizer", "status": "done"}))
 
-            # ── Planner + Critic ──
             elif exp_mode in ["dev_planner_critic", "demo_planner_critic"]:
                 retriever = RetrieverAgent(exp_config=cfg)
                 data = await retriever.process(data, retrieval_setting=retrieval_setting)
-                yield _sse_event("stage", {"stage": "retriever", "status": "done"})
+                await queue.put(_sse_event("stage", {"stage": "retriever", "status": "done"}))
 
                 planner = PlannerAgent(exp_config=cfg)
                 data = await planner.process(data)
-                yield _sse_event("stage", {"stage": "planner", "status": "done"})
+                await queue.put(_sse_event("stage", {"stage": "planner", "status": "done"}))
 
                 visualizer = VisualizerAgent(exp_config=cfg)
                 data = await visualizer.process(data)
-                yield _sse_event("stage", {"stage": "visualizer", "status": "done"})
+                await queue.put(_sse_event("stage", {"stage": "visualizer", "status": "done"}))
 
                 critic = CriticAgent(exp_config=cfg)
                 current_best_key = f"target_{task}_desc0_base64_jpg"
@@ -429,32 +431,31 @@ async def run_pipeline(req: PipelineRequest):
                     data = await critic.process(data, source="planner")
                     sug = data.get(f"target_{task}_critic_suggestions{round_idx}", "")
                     if sug.strip() == "No changes needed.":
-                        yield _sse_event("stage", {"stage": f"critic_round_{round_idx}", "status": "no_changes"})
+                        await queue.put(_sse_event("stage", {"stage": f"critic_round_{round_idx}", "status": "no_changes"}))
                         break
                     data = await visualizer.process(data)
                     new_key = f"target_{task}_critic_desc{round_idx}_base64_jpg"
                     if new_key in data and data[new_key]:
                         current_best_key = new_key
-                    yield _sse_event("stage", {"stage": f"critic_round_{round_idx}", "status": "done"})
+                    await queue.put(_sse_event("stage", {"stage": f"critic_round_{round_idx}", "status": "done"}))
                 data["eval_image_field"] = current_best_key
 
-            # ── Full pipeline ──
             elif exp_mode in ["dev_full", "demo_full"]:
                 retriever = RetrieverAgent(exp_config=cfg)
                 data = await retriever.process(data, retrieval_setting=retrieval_setting)
-                yield _sse_event("stage", {"stage": "retriever", "status": "done"})
+                await queue.put(_sse_event("stage", {"stage": "retriever", "status": "done"}))
 
                 planner = PlannerAgent(exp_config=cfg)
                 data = await planner.process(data)
-                yield _sse_event("stage", {"stage": "planner", "status": "done"})
+                await queue.put(_sse_event("stage", {"stage": "planner", "status": "done"}))
 
                 stylist = StylistAgent(exp_config=cfg)
                 data = await stylist.process(data)
-                yield _sse_event("stage", {"stage": "stylist", "status": "done"})
+                await queue.put(_sse_event("stage", {"stage": "stylist", "status": "done"}))
 
                 visualizer = VisualizerAgent(exp_config=cfg)
                 data = await visualizer.process(data)
-                yield _sse_event("stage", {"stage": "visualizer", "status": "done"})
+                await queue.put(_sse_event("stage", {"stage": "visualizer", "status": "done"}))
 
                 critic = CriticAgent(exp_config=cfg)
                 current_best_key = f"target_{task}_stylist_desc0_base64_jpg"
@@ -463,27 +464,27 @@ async def run_pipeline(req: PipelineRequest):
                     data = await critic.process(data, source="stylist")
                     sug = data.get(f"target_{task}_critic_suggestions{round_idx}", "")
                     if sug.strip() == "No changes needed.":
-                        yield _sse_event("stage", {"stage": f"critic_round_{round_idx}", "status": "no_changes"})
+                        await queue.put(_sse_event("stage", {"stage": f"critic_round_{round_idx}", "status": "no_changes"}))
                         break
                     data = await visualizer.process(data)
                     new_key = f"target_{task}_critic_desc{round_idx}_base64_jpg"
                     if new_key in data and data[new_key]:
                         current_best_key = new_key
-                    yield _sse_event("stage", {"stage": f"critic_round_{round_idx}", "status": "done"})
+                    await queue.put(_sse_event("stage", {"stage": f"critic_round_{round_idx}", "status": "done"}))
                 data["eval_image_field"] = current_best_key
 
-            # ── Polish ──
             elif exp_mode == "dev_polish":
                 agent = PolishAgent(exp_config=cfg)
                 data = await agent.process(data)
                 data["eval_image_field"] = f"polished_{task}_base64_jpg"
-                yield _sse_event("stage", {"stage": "polish", "status": "done"})
+                await queue.put(_sse_event("stage", {"stage": "polish", "status": "done"}))
 
             else:
-                yield _sse_event("error", {"error": f"Unknown exp_mode: {exp_mode}"})
+                await queue.put(_sse_event("error", {"error": f"Unknown exp_mode: {exp_mode}"}))
+                await queue.put(None)
                 return
 
-            # ── Build final response ──
+            # Build final response
             eval_field = data.get("eval_image_field", "")
             image_b64 = data.get(eval_field) if eval_field else None
 
@@ -510,14 +511,35 @@ async def run_pipeline(req: PipelineRequest):
                 descriptions=descriptions,
                 stages=stages,
             )
-            yield _sse_event("result", result.model_dump())
+            await queue.put(_sse_event("result", result.model_dump()))
 
         except Exception as e:
             traceback.print_exc()
-            yield _sse_event("error", {"error": str(e)})
+            await queue.put(_sse_event("error", {"error": str(e)}))
+        finally:
+            await queue.put(None)  # Signal end of stream
+
+    async def _stream_with_keepalive() -> AsyncGenerator[str, None]:
+        """Yield SSE events + keepalive comments to prevent CDN timeout."""
+        # Start the pipeline in a background task
+        pipeline_task = asyncio.create_task(_run_pipeline())
+
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=SSE_KEEPALIVE_INTERVAL)
+                    if msg is None:
+                        break  # Pipeline finished
+                    yield msg
+                except asyncio.TimeoutError:
+                    # No event yet — send keepalive comment to prevent CDN timeout
+                    yield SSE_KEEPALIVE
+        finally:
+            if not pipeline_task.done():
+                pipeline_task.cancel()
 
     return StreamingResponse(
-        _stream(),
+        _stream_with_keepalive(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
