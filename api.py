@@ -1,16 +1,16 @@
 """
-FastAPI layer for PaperVizAgent — one endpoint per agent + full pipeline.
+FastAPI layer for PaperVizAgent — one endpoint per agent + async job pipeline.
 """
 
 import asyncio
 import json
 import os
 import traceback
+import uuid
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from agents.retriever_agent import RetrieverAgent
@@ -21,12 +21,14 @@ from agents.critic_agent import CriticAgent
 from agents.vanilla_agent import VanillaAgent
 from agents.polish_agent import PolishAgent
 from utils.config import ExpConfig
-from utils.paperviz_processor import PaperVizProcessor
 
 app = FastAPI(title="PaperVizAgent API")
 
 WORK_DIR = Path(__file__).parent
 API_KEY = os.environ.get("API_KEY")
+
+# In-memory job store
+_jobs: Dict[str, Dict[str, Any]] = {}
 
 
 async def verify_api_key(request: Request):
@@ -56,15 +58,6 @@ def _make_config(
         model_name=model_name,
         work_dir=WORK_DIR,
     )
-
-
-def _sse_event(event: str, data: Any) -> str:
-    """Format a Server-Sent Event."""
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-
-SSE_KEEPALIVE = ": keepalive\n\n"
-SSE_KEEPALIVE_INTERVAL = 5  # seconds
 
 
 # ── Request / Response Models ────────────────────────────────────────────────
@@ -160,7 +153,7 @@ class PipelineResponse(BaseModel):
     stages: Dict[str, Any] = {}
 
 
-# ── Endpoints ────────────────────────────────────────────────────────────────
+# ── Individual Agent Endpoints ───────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
@@ -334,215 +327,216 @@ async def run_polish(req: PolishRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Pipeline (SSE streaming to avoid CDN timeout) ───────────────────────────
+# ── Pipeline (async job with polling) ────────────────────────────────────────
+
+async def _run_pipeline_job(job_id: str, req: PipelineRequest):
+    """Background task: run the full pipeline and store result in _jobs."""
+    job = _jobs[job_id]
+    try:
+        cfg = _make_config(
+            task_name=req.task_name,
+            retrieval_setting=req.retrieval_setting,
+            exp_mode=req.exp_mode,
+            max_critic_rounds=req.max_critic_rounds or 3,
+        )
+        task = req.task_name
+        retrieval_setting = req.retrieval_setting
+        max_rounds = req.max_critic_rounds or 3
+
+        data: Dict[str, Any] = {
+            "content": req.content,
+            "visual_intent": req.visual_intent,
+            "additional_info": {"rounded_ratio": req.aspect_ratio or "1:1"},
+            "max_critic_rounds": max_rounds,
+        }
+
+        exp_mode = req.exp_mode
+
+        if exp_mode == "vanilla":
+            agent = VanillaAgent(exp_config=cfg)
+            data = await agent.process(data)
+            data["eval_image_field"] = f"vanilla_{task}_base64_jpg"
+            job["current_stage"] = "vanilla"
+
+        elif exp_mode == "dev_planner":
+            retriever = RetrieverAgent(exp_config=cfg)
+            data = await retriever.process(data, retrieval_setting=retrieval_setting)
+            job["current_stage"] = "retriever"
+
+            planner = PlannerAgent(exp_config=cfg)
+            data = await planner.process(data)
+            job["current_stage"] = "planner"
+
+            visualizer = VisualizerAgent(exp_config=cfg)
+            data = await visualizer.process(data)
+            data["eval_image_field"] = f"target_{task}_desc0_base64_jpg"
+            job["current_stage"] = "visualizer"
+
+        elif exp_mode == "dev_planner_stylist":
+            retriever = RetrieverAgent(exp_config=cfg)
+            data = await retriever.process(data, retrieval_setting=retrieval_setting)
+            job["current_stage"] = "retriever"
+
+            planner = PlannerAgent(exp_config=cfg)
+            data = await planner.process(data)
+            job["current_stage"] = "planner"
+
+            stylist = StylistAgent(exp_config=cfg)
+            data = await stylist.process(data)
+            job["current_stage"] = "stylist"
+
+            visualizer = VisualizerAgent(exp_config=cfg)
+            data = await visualizer.process(data)
+            data["eval_image_field"] = f"target_{task}_stylist_desc0_base64_jpg"
+            job["current_stage"] = "visualizer"
+
+        elif exp_mode in ["dev_planner_critic", "demo_planner_critic"]:
+            retriever = RetrieverAgent(exp_config=cfg)
+            data = await retriever.process(data, retrieval_setting=retrieval_setting)
+            job["current_stage"] = "retriever"
+
+            planner = PlannerAgent(exp_config=cfg)
+            data = await planner.process(data)
+            job["current_stage"] = "planner"
+
+            visualizer = VisualizerAgent(exp_config=cfg)
+            data = await visualizer.process(data)
+            job["current_stage"] = "visualizer"
+
+            critic = CriticAgent(exp_config=cfg)
+            current_best_key = f"target_{task}_desc0_base64_jpg"
+            for round_idx in range(max_rounds):
+                data["current_critic_round"] = round_idx
+                data = await critic.process(data, source="planner")
+                sug = data.get(f"target_{task}_critic_suggestions{round_idx}", "")
+                if sug.strip() == "No changes needed.":
+                    job["current_stage"] = f"critic_round_{round_idx}_no_changes"
+                    break
+                data = await visualizer.process(data)
+                new_key = f"target_{task}_critic_desc{round_idx}_base64_jpg"
+                if new_key in data and data[new_key]:
+                    current_best_key = new_key
+                job["current_stage"] = f"critic_round_{round_idx}"
+            data["eval_image_field"] = current_best_key
+
+        elif exp_mode in ["dev_full", "demo_full"]:
+            retriever = RetrieverAgent(exp_config=cfg)
+            data = await retriever.process(data, retrieval_setting=retrieval_setting)
+            job["current_stage"] = "retriever"
+
+            planner = PlannerAgent(exp_config=cfg)
+            data = await planner.process(data)
+            job["current_stage"] = "planner"
+
+            stylist = StylistAgent(exp_config=cfg)
+            data = await stylist.process(data)
+            job["current_stage"] = "stylist"
+
+            visualizer = VisualizerAgent(exp_config=cfg)
+            data = await visualizer.process(data)
+            job["current_stage"] = "visualizer"
+
+            critic = CriticAgent(exp_config=cfg)
+            current_best_key = f"target_{task}_stylist_desc0_base64_jpg"
+            for round_idx in range(max_rounds):
+                data["current_critic_round"] = round_idx
+                data = await critic.process(data, source="stylist")
+                sug = data.get(f"target_{task}_critic_suggestions{round_idx}", "")
+                if sug.strip() == "No changes needed.":
+                    job["current_stage"] = f"critic_round_{round_idx}_no_changes"
+                    break
+                data = await visualizer.process(data)
+                new_key = f"target_{task}_critic_desc{round_idx}_base64_jpg"
+                if new_key in data and data[new_key]:
+                    current_best_key = new_key
+                job["current_stage"] = f"critic_round_{round_idx}"
+            data["eval_image_field"] = current_best_key
+
+        elif exp_mode == "dev_polish":
+            agent = PolishAgent(exp_config=cfg)
+            data = await agent.process(data)
+            data["eval_image_field"] = f"polished_{task}_base64_jpg"
+            job["current_stage"] = "polish"
+
+        else:
+            job["status"] = "failed"
+            job["error"] = f"Unknown exp_mode: {exp_mode}"
+            return
+
+        # Build final response
+        eval_field = data.get("eval_image_field", "")
+        image_b64 = data.get(eval_field) if eval_field else None
+
+        descriptions: Dict[str, str] = {}
+        for key in [
+            f"target_{task}_desc0",
+            f"target_{task}_stylist_desc0",
+            f"target_{task}_critic_desc0",
+            f"target_{task}_critic_desc1",
+            f"target_{task}_critic_desc2",
+        ]:
+            if key in data:
+                descriptions[key] = data[key]
+
+        stages: Dict[str, Any] = {}
+        if "top10_references" in data:
+            stages["retriever"] = {"top10_references": data["top10_references"]}
+        for key in list(data.keys()):
+            if "critic_suggestions" in key:
+                stages[key] = data[key]
+
+        job["status"] = "completed"
+        job["result"] = PipelineResponse(
+            image_base64=image_b64,
+            descriptions=descriptions,
+            stages=stages,
+        ).model_dump()
+
+    except Exception as e:
+        traceback.print_exc()
+        job["status"] = "failed"
+        job["error"] = str(e)
+
 
 @app.post("/pipeline", dependencies=[Depends(verify_api_key)])
-async def run_pipeline(req: PipelineRequest):
+async def start_pipeline(req: PipelineRequest):
     """
-    Run the full pipeline as a Server-Sent Events stream.
-    Sends keepalive comments every few seconds to prevent CDN timeout,
-    plus progress events as each agent completes.
-
-    Events:
-      - event: stage   → {"stage": "retriever", "status": "done"}
-      - event: result  → full PipelineResponse JSON
-      - event: error   → {"error": "..."}
+    Start a pipeline job. Returns immediately with a job_id.
+    Poll GET /pipeline/{job_id} for status and result.
     """
-    # Queue for SSE events from the background pipeline task
-    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {
+        "status": "running",
+        "current_stage": "starting",
+        "result": None,
+        "error": None,
+    }
+    asyncio.create_task(_run_pipeline_job(job_id, req))
+    return {"job_id": job_id}
 
-    async def _run_pipeline():
-        """Background task: run agents and push events to queue."""
-        try:
-            cfg = _make_config(
-                task_name=req.task_name,
-                retrieval_setting=req.retrieval_setting,
-                exp_mode=req.exp_mode,
-                max_critic_rounds=req.max_critic_rounds or 3,
-            )
-            task = req.task_name
-            retrieval_setting = req.retrieval_setting
-            max_rounds = req.max_critic_rounds or 3
 
-            data: Dict[str, Any] = {
-                "content": req.content,
-                "visual_intent": req.visual_intent,
-                "additional_info": {"rounded_ratio": req.aspect_ratio or "1:1"},
-                "max_critic_rounds": max_rounds,
-            }
-
-            exp_mode = req.exp_mode
-
-            if exp_mode == "vanilla":
-                agent = VanillaAgent(exp_config=cfg)
-                data = await agent.process(data)
-                data["eval_image_field"] = f"vanilla_{task}_base64_jpg"
-                await queue.put(_sse_event("stage", {"stage": "vanilla", "status": "done"}))
-
-            elif exp_mode == "dev_planner":
-                retriever = RetrieverAgent(exp_config=cfg)
-                data = await retriever.process(data, retrieval_setting=retrieval_setting)
-                await queue.put(_sse_event("stage", {"stage": "retriever", "status": "done"}))
-
-                planner = PlannerAgent(exp_config=cfg)
-                data = await planner.process(data)
-                await queue.put(_sse_event("stage", {"stage": "planner", "status": "done"}))
-
-                visualizer = VisualizerAgent(exp_config=cfg)
-                data = await visualizer.process(data)
-                data["eval_image_field"] = f"target_{task}_desc0_base64_jpg"
-                await queue.put(_sse_event("stage", {"stage": "visualizer", "status": "done"}))
-
-            elif exp_mode == "dev_planner_stylist":
-                retriever = RetrieverAgent(exp_config=cfg)
-                data = await retriever.process(data, retrieval_setting=retrieval_setting)
-                await queue.put(_sse_event("stage", {"stage": "retriever", "status": "done"}))
-
-                planner = PlannerAgent(exp_config=cfg)
-                data = await planner.process(data)
-                await queue.put(_sse_event("stage", {"stage": "planner", "status": "done"}))
-
-                stylist = StylistAgent(exp_config=cfg)
-                data = await stylist.process(data)
-                await queue.put(_sse_event("stage", {"stage": "stylist", "status": "done"}))
-
-                visualizer = VisualizerAgent(exp_config=cfg)
-                data = await visualizer.process(data)
-                data["eval_image_field"] = f"target_{task}_stylist_desc0_base64_jpg"
-                await queue.put(_sse_event("stage", {"stage": "visualizer", "status": "done"}))
-
-            elif exp_mode in ["dev_planner_critic", "demo_planner_critic"]:
-                retriever = RetrieverAgent(exp_config=cfg)
-                data = await retriever.process(data, retrieval_setting=retrieval_setting)
-                await queue.put(_sse_event("stage", {"stage": "retriever", "status": "done"}))
-
-                planner = PlannerAgent(exp_config=cfg)
-                data = await planner.process(data)
-                await queue.put(_sse_event("stage", {"stage": "planner", "status": "done"}))
-
-                visualizer = VisualizerAgent(exp_config=cfg)
-                data = await visualizer.process(data)
-                await queue.put(_sse_event("stage", {"stage": "visualizer", "status": "done"}))
-
-                critic = CriticAgent(exp_config=cfg)
-                current_best_key = f"target_{task}_desc0_base64_jpg"
-                for round_idx in range(max_rounds):
-                    data["current_critic_round"] = round_idx
-                    data = await critic.process(data, source="planner")
-                    sug = data.get(f"target_{task}_critic_suggestions{round_idx}", "")
-                    if sug.strip() == "No changes needed.":
-                        await queue.put(_sse_event("stage", {"stage": f"critic_round_{round_idx}", "status": "no_changes"}))
-                        break
-                    data = await visualizer.process(data)
-                    new_key = f"target_{task}_critic_desc{round_idx}_base64_jpg"
-                    if new_key in data and data[new_key]:
-                        current_best_key = new_key
-                    await queue.put(_sse_event("stage", {"stage": f"critic_round_{round_idx}", "status": "done"}))
-                data["eval_image_field"] = current_best_key
-
-            elif exp_mode in ["dev_full", "demo_full"]:
-                retriever = RetrieverAgent(exp_config=cfg)
-                data = await retriever.process(data, retrieval_setting=retrieval_setting)
-                await queue.put(_sse_event("stage", {"stage": "retriever", "status": "done"}))
-
-                planner = PlannerAgent(exp_config=cfg)
-                data = await planner.process(data)
-                await queue.put(_sse_event("stage", {"stage": "planner", "status": "done"}))
-
-                stylist = StylistAgent(exp_config=cfg)
-                data = await stylist.process(data)
-                await queue.put(_sse_event("stage", {"stage": "stylist", "status": "done"}))
-
-                visualizer = VisualizerAgent(exp_config=cfg)
-                data = await visualizer.process(data)
-                await queue.put(_sse_event("stage", {"stage": "visualizer", "status": "done"}))
-
-                critic = CriticAgent(exp_config=cfg)
-                current_best_key = f"target_{task}_stylist_desc0_base64_jpg"
-                for round_idx in range(max_rounds):
-                    data["current_critic_round"] = round_idx
-                    data = await critic.process(data, source="stylist")
-                    sug = data.get(f"target_{task}_critic_suggestions{round_idx}", "")
-                    if sug.strip() == "No changes needed.":
-                        await queue.put(_sse_event("stage", {"stage": f"critic_round_{round_idx}", "status": "no_changes"}))
-                        break
-                    data = await visualizer.process(data)
-                    new_key = f"target_{task}_critic_desc{round_idx}_base64_jpg"
-                    if new_key in data and data[new_key]:
-                        current_best_key = new_key
-                    await queue.put(_sse_event("stage", {"stage": f"critic_round_{round_idx}", "status": "done"}))
-                data["eval_image_field"] = current_best_key
-
-            elif exp_mode == "dev_polish":
-                agent = PolishAgent(exp_config=cfg)
-                data = await agent.process(data)
-                data["eval_image_field"] = f"polished_{task}_base64_jpg"
-                await queue.put(_sse_event("stage", {"stage": "polish", "status": "done"}))
-
-            else:
-                await queue.put(_sse_event("error", {"error": f"Unknown exp_mode: {exp_mode}"}))
-                await queue.put(None)
-                return
-
-            # Build final response
-            eval_field = data.get("eval_image_field", "")
-            image_b64 = data.get(eval_field) if eval_field else None
-
-            descriptions: Dict[str, str] = {}
-            for key in [
-                f"target_{task}_desc0",
-                f"target_{task}_stylist_desc0",
-                f"target_{task}_critic_desc0",
-                f"target_{task}_critic_desc1",
-                f"target_{task}_critic_desc2",
-            ]:
-                if key in data:
-                    descriptions[key] = data[key]
-
-            stages: Dict[str, Any] = {}
-            if "top10_references" in data:
-                stages["retriever"] = {"top10_references": data["top10_references"]}
-            for key in list(data.keys()):
-                if "critic_suggestions" in key:
-                    stages[key] = data[key]
-
-            result = PipelineResponse(
-                image_base64=image_b64,
-                descriptions=descriptions,
-                stages=stages,
-            )
-            await queue.put(_sse_event("result", result.model_dump()))
-
-        except Exception as e:
-            traceback.print_exc()
-            await queue.put(_sse_event("error", {"error": str(e)}))
-        finally:
-            await queue.put(None)  # Signal end of stream
-
-    async def _stream_with_keepalive() -> AsyncGenerator[str, None]:
-        """Yield SSE events + keepalive comments to prevent CDN timeout."""
-        # Start the pipeline in a background task
-        pipeline_task = asyncio.create_task(_run_pipeline())
-
-        try:
-            while True:
-                try:
-                    msg = await asyncio.wait_for(queue.get(), timeout=SSE_KEEPALIVE_INTERVAL)
-                    if msg is None:
-                        break  # Pipeline finished
-                    yield msg
-                except asyncio.TimeoutError:
-                    # No event yet — send keepalive comment to prevent CDN timeout
-                    yield SSE_KEEPALIVE
-        finally:
-            if not pipeline_task.done():
-                pipeline_task.cancel()
-
-    return StreamingResponse(
-        _stream_with_keepalive(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
+@app.get("/pipeline/{job_id}", dependencies=[Depends(verify_api_key)])
+async def get_pipeline_status(job_id: str):
+    """
+    Poll pipeline job status.
+    Returns:
+      - status: "running" | "completed" | "failed"
+      - current_stage: which agent is currently running
+      - result: PipelineResponse (only when completed)
+      - error: error message (only when failed)
+    """
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    response = {
+        "status": job["status"],
+        "current_stage": job["current_stage"],
+    }
+    if job["status"] == "completed":
+        response["result"] = job["result"]
+        # Clean up completed job after retrieval
+        del _jobs[job_id]
+    elif job["status"] == "failed":
+        response["error"] = job["error"]
+        del _jobs[job_id]
+    return response
