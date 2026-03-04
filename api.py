@@ -2,12 +2,15 @@
 FastAPI layer for PaperVizAgent — one endpoint per agent + full pipeline.
 """
 
+import asyncio
+import json
 import os
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, AsyncGenerator, Dict, List, Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from agents.retriever_agent import RetrieverAgent
@@ -53,6 +56,11 @@ def _make_config(
         model_name=model_name,
         work_dir=WORK_DIR,
     )
+
+
+def _sse_event(event: str, data: Any) -> str:
+    """Format a Server-Sent Event."""
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 # ── Request / Response Models ────────────────────────────────────────────────
@@ -140,6 +148,7 @@ class PipelineRequest(BaseModel):
     retrieval_setting: Literal["auto", "manual", "random", "none"] = "auto"
     aspect_ratio: Optional[str] = "1:1"
     max_critic_rounds: Optional[int] = 3
+
 
 class PipelineResponse(BaseModel):
     image_base64: Optional[str] = None
@@ -276,11 +285,9 @@ async def run_polish(req: PolishRequest):
         agent = PolishAgent(exp_config=cfg)
         task = req.task_name
         data: Dict[str, Any] = {
-            "path_to_gt_image": None,  # not used when image_base64 provided directly
+            "path_to_gt_image": None,
             "additional_info": {"rounded_ratio": req.aspect_ratio or "16:9"},
         }
-        # Polish agent normally loads from file — override _generate_suggestions
-        # to work with the provided base64 directly
         style_guide_path = WORK_DIR / "style_guides" / agent.style_guide_filename
         with open(style_guide_path, "r", encoding="utf-8") as f:
             style_guide = f.read()
@@ -288,7 +295,6 @@ async def run_polish(req: PolishRequest):
         suggestions = await agent._generate_suggestions(req.image_base64, style_guide)
         data[f"suggestions_{task}"] = suggestions
 
-        # Step 2: generate polished image
         from utils import generation_utils, image_utils
         content_list = [
             {"type": "text", "text": f"Please polish this image based on the following suggestions:\n\n{suggestions}\n\nPolished Image:"},
@@ -324,63 +330,197 @@ async def run_polish(req: PolishRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/pipeline", response_model=PipelineResponse, dependencies=[Depends(verify_api_key)])
+# ── Pipeline (SSE streaming to avoid CDN timeout) ───────────────────────────
+
+@app.post("/pipeline", dependencies=[Depends(verify_api_key)])
 async def run_pipeline(req: PipelineRequest):
-    try:
-        cfg = _make_config(
-            task_name=req.task_name,
-            retrieval_setting=req.retrieval_setting,
-            exp_mode=req.exp_mode,
-            max_critic_rounds=req.max_critic_rounds or 3,
-        )
-        processor = PaperVizProcessor(
-            exp_config=cfg,
-            vanilla_agent=VanillaAgent(exp_config=cfg),
-            planner_agent=PlannerAgent(exp_config=cfg),
-            visualizer_agent=VisualizerAgent(exp_config=cfg),
-            stylist_agent=StylistAgent(exp_config=cfg),
-            critic_agent=CriticAgent(exp_config=cfg),
-            retriever_agent=RetrieverAgent(exp_config=cfg),
-            polish_agent=PolishAgent(exp_config=cfg),
-        )
-        data: Dict[str, Any] = {
-            "content": req.content,
-            "visual_intent": req.visual_intent,
-            "additional_info": {"rounded_ratio": req.aspect_ratio or "1:1"},
-            "max_critic_rounds": req.max_critic_rounds or 3,
-        }
-        result = await processor.process_single_query(data, do_eval=False)
+    """
+    Run the full pipeline as a Server-Sent Events stream.
+    Sends progress events as each agent completes, preventing CDN timeout.
 
-        # Extract final image from eval_image_field
-        eval_field = result.get("eval_image_field", "")
-        image_b64 = result.get(eval_field) if eval_field else None
+    Events:
+      - event: stage   → {"stage": "retriever", "status": "done", ...}
+      - event: stage   → {"stage": "planner", "status": "done", ...}
+      - ...
+      - event: result  → full PipelineResponse JSON
+      - event: error   → {"error": "..."}
+    """
 
-        # Collect descriptions
-        task = req.task_name
-        descriptions: Dict[str, str] = {}
-        for key in [
-            f"target_{task}_desc0",
-            f"target_{task}_stylist_desc0",
-            f"target_{task}_critic_desc0",
-            f"target_{task}_critic_desc1",
-            f"target_{task}_critic_desc2",
-        ]:
-            if key in result:
-                descriptions[key] = result[key]
+    async def _stream() -> AsyncGenerator[str, None]:
+        try:
+            cfg = _make_config(
+                task_name=req.task_name,
+                retrieval_setting=req.retrieval_setting,
+                exp_mode=req.exp_mode,
+                max_critic_rounds=req.max_critic_rounds or 3,
+            )
+            task = req.task_name
+            retrieval_setting = req.retrieval_setting
+            max_rounds = req.max_critic_rounds or 3
 
-        # Collect stage metadata
-        stages: Dict[str, Any] = {}
-        if "top10_references" in result:
-            stages["retriever"] = {"top10_references": result["top10_references"]}
-        for key in list(result.keys()):
-            if "critic_suggestions" in key:
-                stages[key] = result[key]
+            data: Dict[str, Any] = {
+                "content": req.content,
+                "visual_intent": req.visual_intent,
+                "additional_info": {"rounded_ratio": req.aspect_ratio or "1:1"},
+                "max_critic_rounds": max_rounds,
+            }
 
-        return PipelineResponse(
-            image_base64=image_b64,
-            descriptions=descriptions,
-            stages=stages,
-        )
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+            exp_mode = req.exp_mode
+
+            # ── Vanilla mode ──
+            if exp_mode == "vanilla":
+                agent = VanillaAgent(exp_config=cfg)
+                data = await agent.process(data)
+                data["eval_image_field"] = f"vanilla_{task}_base64_jpg"
+                yield _sse_event("stage", {"stage": "vanilla", "status": "done"})
+
+            # ── Planner only ──
+            elif exp_mode == "dev_planner":
+                retriever = RetrieverAgent(exp_config=cfg)
+                data = await retriever.process(data, retrieval_setting=retrieval_setting)
+                yield _sse_event("stage", {"stage": "retriever", "status": "done"})
+
+                planner = PlannerAgent(exp_config=cfg)
+                data = await planner.process(data)
+                yield _sse_event("stage", {"stage": "planner", "status": "done"})
+
+                visualizer = VisualizerAgent(exp_config=cfg)
+                data = await visualizer.process(data)
+                data["eval_image_field"] = f"target_{task}_desc0_base64_jpg"
+                yield _sse_event("stage", {"stage": "visualizer", "status": "done"})
+
+            # ── Planner + Stylist ──
+            elif exp_mode == "dev_planner_stylist":
+                retriever = RetrieverAgent(exp_config=cfg)
+                data = await retriever.process(data, retrieval_setting=retrieval_setting)
+                yield _sse_event("stage", {"stage": "retriever", "status": "done"})
+
+                planner = PlannerAgent(exp_config=cfg)
+                data = await planner.process(data)
+                yield _sse_event("stage", {"stage": "planner", "status": "done"})
+
+                stylist = StylistAgent(exp_config=cfg)
+                data = await stylist.process(data)
+                yield _sse_event("stage", {"stage": "stylist", "status": "done"})
+
+                visualizer = VisualizerAgent(exp_config=cfg)
+                data = await visualizer.process(data)
+                data["eval_image_field"] = f"target_{task}_stylist_desc0_base64_jpg"
+                yield _sse_event("stage", {"stage": "visualizer", "status": "done"})
+
+            # ── Planner + Critic ──
+            elif exp_mode in ["dev_planner_critic", "demo_planner_critic"]:
+                retriever = RetrieverAgent(exp_config=cfg)
+                data = await retriever.process(data, retrieval_setting=retrieval_setting)
+                yield _sse_event("stage", {"stage": "retriever", "status": "done"})
+
+                planner = PlannerAgent(exp_config=cfg)
+                data = await planner.process(data)
+                yield _sse_event("stage", {"stage": "planner", "status": "done"})
+
+                visualizer = VisualizerAgent(exp_config=cfg)
+                data = await visualizer.process(data)
+                yield _sse_event("stage", {"stage": "visualizer", "status": "done"})
+
+                critic = CriticAgent(exp_config=cfg)
+                current_best_key = f"target_{task}_desc0_base64_jpg"
+                for round_idx in range(max_rounds):
+                    data["current_critic_round"] = round_idx
+                    data = await critic.process(data, source="planner")
+                    sug = data.get(f"target_{task}_critic_suggestions{round_idx}", "")
+                    if sug.strip() == "No changes needed.":
+                        yield _sse_event("stage", {"stage": f"critic_round_{round_idx}", "status": "no_changes"})
+                        break
+                    data = await visualizer.process(data)
+                    new_key = f"target_{task}_critic_desc{round_idx}_base64_jpg"
+                    if new_key in data and data[new_key]:
+                        current_best_key = new_key
+                    yield _sse_event("stage", {"stage": f"critic_round_{round_idx}", "status": "done"})
+                data["eval_image_field"] = current_best_key
+
+            # ── Full pipeline ──
+            elif exp_mode in ["dev_full", "demo_full"]:
+                retriever = RetrieverAgent(exp_config=cfg)
+                data = await retriever.process(data, retrieval_setting=retrieval_setting)
+                yield _sse_event("stage", {"stage": "retriever", "status": "done"})
+
+                planner = PlannerAgent(exp_config=cfg)
+                data = await planner.process(data)
+                yield _sse_event("stage", {"stage": "planner", "status": "done"})
+
+                stylist = StylistAgent(exp_config=cfg)
+                data = await stylist.process(data)
+                yield _sse_event("stage", {"stage": "stylist", "status": "done"})
+
+                visualizer = VisualizerAgent(exp_config=cfg)
+                data = await visualizer.process(data)
+                yield _sse_event("stage", {"stage": "visualizer", "status": "done"})
+
+                critic = CriticAgent(exp_config=cfg)
+                current_best_key = f"target_{task}_stylist_desc0_base64_jpg"
+                for round_idx in range(max_rounds):
+                    data["current_critic_round"] = round_idx
+                    data = await critic.process(data, source="stylist")
+                    sug = data.get(f"target_{task}_critic_suggestions{round_idx}", "")
+                    if sug.strip() == "No changes needed.":
+                        yield _sse_event("stage", {"stage": f"critic_round_{round_idx}", "status": "no_changes"})
+                        break
+                    data = await visualizer.process(data)
+                    new_key = f"target_{task}_critic_desc{round_idx}_base64_jpg"
+                    if new_key in data and data[new_key]:
+                        current_best_key = new_key
+                    yield _sse_event("stage", {"stage": f"critic_round_{round_idx}", "status": "done"})
+                data["eval_image_field"] = current_best_key
+
+            # ── Polish ──
+            elif exp_mode == "dev_polish":
+                agent = PolishAgent(exp_config=cfg)
+                data = await agent.process(data)
+                data["eval_image_field"] = f"polished_{task}_base64_jpg"
+                yield _sse_event("stage", {"stage": "polish", "status": "done"})
+
+            else:
+                yield _sse_event("error", {"error": f"Unknown exp_mode: {exp_mode}"})
+                return
+
+            # ── Build final response ──
+            eval_field = data.get("eval_image_field", "")
+            image_b64 = data.get(eval_field) if eval_field else None
+
+            descriptions: Dict[str, str] = {}
+            for key in [
+                f"target_{task}_desc0",
+                f"target_{task}_stylist_desc0",
+                f"target_{task}_critic_desc0",
+                f"target_{task}_critic_desc1",
+                f"target_{task}_critic_desc2",
+            ]:
+                if key in data:
+                    descriptions[key] = data[key]
+
+            stages: Dict[str, Any] = {}
+            if "top10_references" in data:
+                stages["retriever"] = {"top10_references": data["top10_references"]}
+            for key in list(data.keys()):
+                if "critic_suggestions" in key:
+                    stages[key] = data[key]
+
+            result = PipelineResponse(
+                image_base64=image_b64,
+                descriptions=descriptions,
+                stages=stages,
+            )
+            yield _sse_event("result", result.model_dump())
+
+        except Exception as e:
+            traceback.print_exc()
+            yield _sse_event("error", {"error": str(e)})
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
