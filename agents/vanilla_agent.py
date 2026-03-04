@@ -133,15 +133,7 @@ class VanillaAgent(BaseAgent):
                 "image_size": "1K",
             }
         
-        if "gemini" in self.model_name:
-            response_list = await generation_utils.call_gemini_with_retry_async(
-                model_name=self.model_name,
-                contents=content_list,
-                config=gen_config_args,
-                max_attempts=5,
-                retry_delay=30,
-            )
-        elif "gpt-image" in self.model_name:
+        if "gpt-image" in self.model_name:
             image_config = {
                 "size": "1536x1024",
                 "quality": "high",
@@ -150,13 +142,20 @@ class VanillaAgent(BaseAgent):
             }
             response_list = await generation_utils.call_openai_image_generation_with_retry_async(
                 model_name=self.model_name,
-                prompt=prompt_text[:30000], # OpenAI GPT-Image-1.5 only supports input string length up to 32000
+                prompt=prompt_text[:30000],
                 config=image_config,
                 max_attempts=5,
                 retry_delay=30,
             )
         else:
-            raise ValueError(f"Unsupported model: {self.model_name}")
+            # Route to kie.ai unified API (supports gemini, nano-banana, etc.)
+            response_list = await generation_utils.call_gemini_with_retry_async(
+                model_name=self.model_name,
+                contents=content_list,
+                config=gen_config_args,
+                max_attempts=5,
+                retry_delay=30,
+            )
         
         output_key = f"vanilla_{cfg['task_name']}_base64_jpg"
         if cfg["use_image_generation"]:

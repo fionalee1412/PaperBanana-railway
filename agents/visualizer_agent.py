@@ -148,7 +148,7 @@ class VisualizerAgent(BaseAgent):
                 "max_output_tokens": cfg["max_output_tokens"],
             }
             
-            if cfg["use_image_generation"] and "gemini" in self.model_name:
+            if cfg["use_image_generation"] and "gpt-image" not in self.model_name:
                 # Default to 1:1 if aspect ratio is missing
                 aspect_ratio = "1:1"
                 if "additional_info" in data and "rounded_ratio" in data["additional_info"]:
@@ -160,15 +160,7 @@ class VisualizerAgent(BaseAgent):
                     "image_size": "1K",
                 }
             
-            if "gemini" in self.model_name:
-                response_list = await generation_utils.call_gemini_with_retry_async(
-                    model_name=self.model_name,
-                    contents=content_list,
-                    config=gen_config_args,
-                    max_attempts=5,
-                    retry_delay=30,
-                )
-            elif "gpt-image" in self.model_name:
+            if "gpt-image" in self.model_name:
                 image_config = {
                     "size": "1536x1024",
                     "quality": "high",
@@ -183,7 +175,14 @@ class VisualizerAgent(BaseAgent):
                     retry_delay=30,
                 )
             else:
-                raise ValueError(f"Unsupported model: {self.model_name}")
+                # Route to kie.ai unified API (supports gemini, nano-banana, etc.)
+                response_list = await generation_utils.call_gemini_with_retry_async(
+                    model_name=self.model_name,
+                    contents=content_list,
+                    config=gen_config_args,
+                    max_attempts=5,
+                    retry_delay=30,
+                )
             
             if not response_list or not response_list[0]:
                 continue
