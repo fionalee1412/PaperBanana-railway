@@ -4,11 +4,16 @@ FastAPI layer for PaperVizAgent — one endpoint per agent + async job pipeline.
 
 import asyncio
 import json
+import logging
 import os
+import time
 import traceback
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("pipeline")
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
@@ -332,6 +337,8 @@ async def run_polish(req: PolishRequest):
 async def _run_pipeline_job(job_id: str, req: PipelineRequest):
     """Background task: run the full pipeline and store result in _jobs."""
     job = _jobs[job_id]
+    t0 = time.time()
+    logger.info(f"[Job {job_id}] Pipeline started: exp_mode={req.exp_mode}, task={req.task_name}")
     try:
         cfg = _make_config(
             task_name=req.task_name,
@@ -352,111 +359,117 @@ async def _run_pipeline_job(job_id: str, req: PipelineRequest):
 
         exp_mode = req.exp_mode
 
+        def _stage(name: str):
+            job["current_stage"] = name
+            logger.info(f"[Job {job_id}] Stage: {name}")
+
         if exp_mode == "vanilla":
+            _stage("vanilla")
             agent = VanillaAgent(exp_config=cfg)
             data = await agent.process(data)
             data["eval_image_field"] = f"vanilla_{task}_base64_jpg"
-            job["current_stage"] = "vanilla"
 
         elif exp_mode == "dev_planner":
+            _stage("retriever")
             retriever = RetrieverAgent(exp_config=cfg)
             data = await retriever.process(data, retrieval_setting=retrieval_setting)
-            job["current_stage"] = "retriever"
 
+            _stage("planner")
             planner = PlannerAgent(exp_config=cfg)
             data = await planner.process(data)
-            job["current_stage"] = "planner"
 
+            _stage("visualizer")
             visualizer = VisualizerAgent(exp_config=cfg)
             data = await visualizer.process(data)
             data["eval_image_field"] = f"target_{task}_desc0_base64_jpg"
-            job["current_stage"] = "visualizer"
 
         elif exp_mode == "dev_planner_stylist":
+            _stage("retriever")
             retriever = RetrieverAgent(exp_config=cfg)
             data = await retriever.process(data, retrieval_setting=retrieval_setting)
-            job["current_stage"] = "retriever"
 
+            _stage("planner")
             planner = PlannerAgent(exp_config=cfg)
             data = await planner.process(data)
-            job["current_stage"] = "planner"
 
+            _stage("stylist")
             stylist = StylistAgent(exp_config=cfg)
             data = await stylist.process(data)
-            job["current_stage"] = "stylist"
 
+            _stage("visualizer")
             visualizer = VisualizerAgent(exp_config=cfg)
             data = await visualizer.process(data)
             data["eval_image_field"] = f"target_{task}_stylist_desc0_base64_jpg"
-            job["current_stage"] = "visualizer"
 
         elif exp_mode in ["dev_planner_critic", "demo_planner_critic"]:
+            _stage("retriever")
             retriever = RetrieverAgent(exp_config=cfg)
             data = await retriever.process(data, retrieval_setting=retrieval_setting)
-            job["current_stage"] = "retriever"
 
+            _stage("planner")
             planner = PlannerAgent(exp_config=cfg)
             data = await planner.process(data)
-            job["current_stage"] = "planner"
 
+            _stage("visualizer")
             visualizer = VisualizerAgent(exp_config=cfg)
             data = await visualizer.process(data)
-            job["current_stage"] = "visualizer"
 
             critic = CriticAgent(exp_config=cfg)
             current_best_key = f"target_{task}_desc0_base64_jpg"
             for round_idx in range(max_rounds):
+                _stage(f"critic_round_{round_idx}")
                 data["current_critic_round"] = round_idx
                 data = await critic.process(data, source="planner")
                 sug = data.get(f"target_{task}_critic_suggestions{round_idx}", "")
                 if sug.strip() == "No changes needed.":
-                    job["current_stage"] = f"critic_round_{round_idx}_no_changes"
+                    logger.info(f"[Job {job_id}] Critic round {round_idx}: no changes needed")
                     break
+                _stage(f"critic_round_{round_idx}_visualize")
                 data = await visualizer.process(data)
                 new_key = f"target_{task}_critic_desc{round_idx}_base64_jpg"
                 if new_key in data and data[new_key]:
                     current_best_key = new_key
-                job["current_stage"] = f"critic_round_{round_idx}"
             data["eval_image_field"] = current_best_key
 
         elif exp_mode in ["dev_full", "demo_full"]:
+            _stage("retriever")
             retriever = RetrieverAgent(exp_config=cfg)
             data = await retriever.process(data, retrieval_setting=retrieval_setting)
-            job["current_stage"] = "retriever"
 
+            _stage("planner")
             planner = PlannerAgent(exp_config=cfg)
             data = await planner.process(data)
-            job["current_stage"] = "planner"
 
+            _stage("stylist")
             stylist = StylistAgent(exp_config=cfg)
             data = await stylist.process(data)
-            job["current_stage"] = "stylist"
 
+            _stage("visualizer")
             visualizer = VisualizerAgent(exp_config=cfg)
             data = await visualizer.process(data)
-            job["current_stage"] = "visualizer"
 
             critic = CriticAgent(exp_config=cfg)
             current_best_key = f"target_{task}_stylist_desc0_base64_jpg"
             for round_idx in range(max_rounds):
+                _stage(f"critic_round_{round_idx}")
                 data["current_critic_round"] = round_idx
                 data = await critic.process(data, source="stylist")
                 sug = data.get(f"target_{task}_critic_suggestions{round_idx}", "")
                 if sug.strip() == "No changes needed.":
-                    job["current_stage"] = f"critic_round_{round_idx}_no_changes"
+                    logger.info(f"[Job {job_id}] Critic round {round_idx}: no changes needed")
                     break
+                _stage(f"critic_round_{round_idx}_visualize")
                 data = await visualizer.process(data)
                 new_key = f"target_{task}_critic_desc{round_idx}_base64_jpg"
                 if new_key in data and data[new_key]:
                     current_best_key = new_key
-                job["current_stage"] = f"critic_round_{round_idx}"
             data["eval_image_field"] = current_best_key
 
         elif exp_mode == "dev_polish":
+            _stage("polish")
             agent = PolishAgent(exp_config=cfg)
             data = await agent.process(data)
             data["eval_image_field"] = f"polished_{task}_base64_jpg"
-            job["current_stage"] = "polish"
 
         else:
             job["status"] = "failed"
@@ -485,6 +498,7 @@ async def _run_pipeline_job(job_id: str, req: PipelineRequest):
             if "critic_suggestions" in key:
                 stages[key] = data[key]
 
+        logger.info(f"[Job {job_id}] Pipeline completed in {time.time() - t0:.1f}s")
         job["status"] = "completed"
         job["result"] = PipelineResponse(
             image_base64=image_b64,
@@ -493,6 +507,7 @@ async def _run_pipeline_job(job_id: str, req: PipelineRequest):
         ).model_dump()
 
     except Exception as e:
+        logger.error(f"[Job {job_id}] Pipeline failed at stage '{job['current_stage']}' after {time.time() - t0:.1f}s: {e}")
         traceback.print_exc()
         job["status"] = "failed"
         job["error"] = str(e)
